@@ -1,0 +1,5 @@
+mechfight-kit/
+__pycache__/
+*.pyc
+grid.bin
+grid.json
