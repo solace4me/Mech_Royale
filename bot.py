@@ -203,7 +203,7 @@ class Nav:
 
 
 class Bot:
-    name = "temi-hunter2"
+    name = "temi-hunter3"
 
     def __init__(self, hello):
         self.cfg = hello["config"]
@@ -324,12 +324,12 @@ class Bot:
         farm = (target is None and hp_frac > 0.5 and me["in_zone"]
                 and not (self.threat and t - self.threat[1] < 4 and self.threat[3] != "npc"))
         if npc_target is None and farm:
-            near_npcs = [n for n in npcs if math.dist(n["pos"][:2], (x, y)) < 110]
+            near_npcs = [n for n in npcs if math.dist(n["pos"][:2], (x, y)) < 160]
             if near_npcs:
                 npc_target = min(near_npcs, key=lambda n: math.dist(n["pos"][:2], (x, y)))
         crate_target = None
         if npc_target is None and farm:
-            crates = [c for c in obs.get("crates", []) if math.dist(c["pos"][:2], (x, y)) < 90]
+            crates = [c for c in obs.get("crates", []) if math.dist(c["pos"][:2], (x, y)) < 150 and abs(c["pos"][2] - z) < 12]
             if crates:
                 c = min(crates, key=lambda c: math.dist(c["pos"][:2], (x, y)))
                 crate_target = {"pos": [c["pos"][0], c["pos"][1], c["pos"][2] - 3.3], "vel": [0, 0, 0],
@@ -461,12 +461,21 @@ class Bot:
             for dr in obs.get("drops", []):
                 dd = math.dist(dr["pos"][:2], (x, y))
                 eta = dd / max(me["stats"].get("walk_speed", 11.7), 1)
-                if dd < 220 and dr.get("lands_in", 0) < eta + 6 and (dr.get("holder") in (None, self.slot)):
+                if dd < 300 and dr.get("lands_in", 0) < eta + 6 and (dr.get("holder") in (None, self.slot)):
                     rivals = [m for m in mechs if math.dist(m["pos"][:2], dr["pos"][:2]) < 25]
                     if len(rivals) <= 1:
                         drop_goal = dr["pos"]
                         break
-        goal_xy = cube_goal or drop_goal
+        # walk toward a drone or crate we're farming until it's in comfortable range
+        farm_goal = None
+        if greedy and not retreat and target is None:
+            ft = npc_target if npc_target is not None else crate_target
+            if ft is not None:
+                fd = math.dist(ft["pos"][:2], (x, y))
+                want = 80 if ft is npc_target else 55
+                if fd > want or not self.grid.los((x, y, mz), (ft["pos"][0], ft["pos"][1], ft["pos"][2] + 1.5)):
+                    farm_goal = ft["pos"]
+        goal_xy = cube_goal or drop_goal or farm_goal
         if goal_xy is not None:
             gx, gy = goal_xy[0], goal_xy[1]
             if math.dist((gx, gy), (x, y)) > 2.5:
