@@ -203,7 +203,7 @@ class Nav:
 
 
 class Bot:
-    name = "temi-survivor"
+    name = "temi-hunter"
 
     def __init__(self, hello):
         self.cfg = hello["config"]
@@ -227,7 +227,11 @@ class Bot:
     def lead(self, me_pos, mz, tgt, speed):
         px, py, pz = tgt["pos"]
         vx, vy, vz = tgt.get("vel", [0, 0, 0])
-        tz = pz + 4.5
+        # aim at the body's middle: mechs are 9 m tall (scaled by cubes), drones 3.5 m
+        if tgt.get("kind") == "npc":
+            tz = pz + 1.75
+        else:
+            tz = pz + 4.5 * (1 + 0.05 * min(tgt.get("cubes", 0) or 0, 40))
         t = 0.0
         for _ in range(3):
             ax, ay, az = px + vx * t, py + vy * t, tz + vz * t
@@ -312,6 +316,19 @@ class Bot:
             for n in npcs:
                 if n["id"] == self.threat[2]:
                     npc_target = n
+        farm = (target is None and hp_frac > 0.5 and me["in_zone"]
+                and not (self.threat and t - self.threat[1] < 4 and self.threat[3] != "npc"))
+        if npc_target is None and farm:
+            near_npcs = [n for n in npcs if math.dist(n["pos"][:2], (x, y)) < 110]
+            if near_npcs:
+                npc_target = min(near_npcs, key=lambda n: math.dist(n["pos"][:2], (x, y)))
+        crate_target = None
+        if npc_target is None and farm:
+            crates = [c for c in obs.get("crates", []) if math.dist(c["pos"][:2], (x, y)) < 90]
+            if crates:
+                c = min(crates, key=lambda c: math.dist(c["pos"][:2], (x, y)))
+                crate_target = {"pos": [c["pos"][0], c["pos"][1], c["pos"][2] - 3.3], "vel": [0, 0, 0],
+                                "id": c["id"], "hp": 1, "max_hp": 1}
 
         # ---- movement goal ----
         move = None
@@ -332,13 +349,11 @@ class Bot:
             their = target.get("hp", 1400) / max(target.get("max_hp", 1400), 1)
             winning = their < 0.35 and hp_frac > 0.6
             if not late and not winning:
-                if hp_frac < 0.55 and their > hp_frac - 0.1:
+                if hp_frac < 0.3 and their > hp_frac:
                     retreat = True
-                elif td > 70 and t - self.last_hit_t < 3:
-                    retreat = True  # don't trade at range in the open: break line of sight
-                elif "laser" in target.get("weapons", []) and td > 60:
-                    retreat = True
-        elif self.threat and t - self.threat[1] < 2.5 and (hp_frac < 0.6 or not late):
+                elif td > 120 and t - self.last_hit_t < 3 and "laser" in target.get("weapons", []):
+                    retreat = True  # a laser out-trades our gun at long range
+        elif self.threat and t - self.threat[1] < 2.5 and hp_frac < 0.3:
             retreat = True
 
         if goal is not None:
@@ -377,6 +392,15 @@ class Bot:
                         ang = math.atan2(c[1] - y, c[0] - x)
                         move = (math.cos(ang), math.sin(ang))
 
+        # chase a nearly dead mech we can see
+        if target is not None and not retreat and not zone_urgent:
+            their = target.get("hp", 1400) / max(target.get("max_hp", 1400), 1)
+            td = math.dist(target["pos"][:2], (x, y))
+            if their < 0.35 and td > 25:
+                ang = math.atan2(target["pos"][1] - y, target["pos"][0] - x)
+                move = (math.cos(ang), math.sin(ang))
+                boost = me["energy"] > 30
+
         # strafe while under fire or fighting
         fighting = target is not None or (self.threat and t - self.threat[1] < 2)
         if fighting and not retreat:
@@ -401,7 +425,7 @@ class Bot:
             boost = me["energy"] > 15
 
         # avoid NPC drones' aggro radius unless we are fighting one
-        if npc_target is None:
+        if npc_target is None and not farm:
             for n in npcs:
                 d = math.dist(n["pos"][:2], (x, y))
                 if d < 55:
@@ -430,7 +454,7 @@ class Bot:
                     elif WEAPON_PREF.get(p["kind"], 0) > WEAPON_PREF.get(me["weapons"][1]["kind"], 0) and not (me["weapons"][1].get("charge")):
                         act["take"] = p["id"]
                         act["drop"] = 1
-                elif d < 35 and abs(p["pos"][2] - z) < 6 and not fighting and not zone_urgent:
+                elif d < 60 and abs(p["pos"][2] - z) < 6 and not fighting and not zone_urgent:
                     if me["weapons"][1] is None or WEAPON_PREF.get(p["kind"], 0) > WEAPON_PREF.get(me["weapons"][1]["kind"], 0):
                         if best is None or d < best[0]:
                             best = (d, p)
@@ -481,7 +505,7 @@ class Bot:
         fire = [False, False]
         gun = me["weapons"][0]
         second = me["weapons"][1]
-        aim_t = target if target is not None else npc_target
+        aim_t = target if target is not None else (npc_target if npc_target is not None else crate_target)
         if aim_t is not None:
             speed = gun["stats"]["speed"] if gun and gun.get("kind") == "gun" else 252
             yaw, pitch, at = self.lead((x, y), mz, aim_t, speed)
