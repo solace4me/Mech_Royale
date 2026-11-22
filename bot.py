@@ -203,7 +203,7 @@ class Nav:
 
 
 class Bot:
-    name = "temi-hunter"
+    name = "temi-hunter2"
 
     def __init__(self, hello):
         self.cfg = hello["config"]
@@ -221,6 +221,7 @@ class Bot:
         self.scan_yaw = None
         self.laser_hold = 0.0
         self.home = None
+        self.loot_spot = None     # (x, y, until): where a kill dropped cubes
         self.prev_dir = None
 
     # ---------- helpers ----------
@@ -287,6 +288,10 @@ class Bot:
 
         # threats from damage events
         for ev in obs.get("events", []):
+            if ev.get("type") == "kill":
+                last = self.enemies.get(ev.get("target"))
+                if last is not None:
+                    self.loot_spot = (last[0][0], last[0][1], t + 25)
             if ev.get("type") == "damaged" and ev.get("by") is not None and ev.get("bearing") is not None:
                 self.threat = (ev["bearing"], t, ev["by"], ev.get("weapon"))
                 self.last_hit_t = t
@@ -434,13 +439,46 @@ class Bot:
                     mx, my = move if move is not None else (0.0, 0.0)
                     move = (mx + ax / max(d, 1) * w * 1.5, my + ay / max(d, 1) * w * 1.5)
 
-        # grab cubes and good weapons close by when not under pressure
-        if not fighting and not zone_urgent:
-            for c in obs.get("cubes", []):
-                if math.dist(c["pos"][:2], (x, y)) < 30 and abs(c["pos"][2] - z) < 6:
-                    ang = math.atan2(c["pos"][1] - y, c["pos"][0] - x)
-                    move = (math.cos(ang), math.sin(ang))
-                    break
+        # cubes make us bigger and stronger: collect them, even mid-fight when healthy
+        zone_ok = not zone_critical
+        nearest_enemy = min((math.dist(m["pos"][:2], (x, y)) for m in mechs), default=1e9)
+        greedy = zone_ok and (not fighting or (hp_frac > 0.5 and nearest_enemy > 50))
+        cube_goal = None
+        if greedy and not retreat:
+            cs = [c for c in obs.get("cubes", []) if abs(c["pos"][2] - z) < 8]
+            if cs:
+                c = min(cs, key=lambda c: math.dist(c["pos"][:2], (x, y)))
+                if math.dist(c["pos"][:2], (x, y)) < 80:
+                    cube_goal = c["pos"]
+            if cube_goal is None and self.loot_spot is not None and t < self.loot_spot[2]:
+                if math.dist(self.loot_spot[:2], (x, y)) < 120 and hp_frac > 0.35:
+                    cube_goal = self.loot_spot
+                    if math.dist(self.loot_spot[:2], (x, y)) < 6:
+                        self.loot_spot = None
+        # supply drops: 3 cubes, full HP and energy for standing in the ring alone
+        drop_goal = None
+        if zone_ok and not retreat and hp_frac > 0.45 and cube_goal is None:
+            for dr in obs.get("drops", []):
+                dd = math.dist(dr["pos"][:2], (x, y))
+                eta = dd / max(me["stats"].get("walk_speed", 11.7), 1)
+                if dd < 220 and dr.get("lands_in", 0) < eta + 6 and (dr.get("holder") in (None, self.slot)):
+                    rivals = [m for m in mechs if math.dist(m["pos"][:2], dr["pos"][:2]) < 25]
+                    if len(rivals) <= 1:
+                        drop_goal = dr["pos"]
+                        break
+        goal_xy = cube_goal or drop_goal
+        if goal_xy is not None:
+            gx, gy = goal_xy[0], goal_xy[1]
+            if math.dist((gx, gy), (x, y)) > 2.5:
+                ang = math.atan2(gy - y, gx - x)
+                gm = (math.cos(ang), math.sin(ang))
+                if fighting and move is not None:
+                    move = (gm[0] + move[0] * 0.4, gm[1] + move[1] * 0.4)  # keep some jink
+                else:
+                    move = gm
+                boost = boost or (me["energy"] > 40 and math.dist((gx, gy), (x, y)) > 20)
+            elif drop_goal is not None and not fighting:
+                move = None  # stand in the ring
         held = [w["kind"] for w in me["weapons"] if w]
         if me["weapons"][1] is None or not fighting:
             best = None
