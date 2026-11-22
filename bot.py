@@ -147,7 +147,7 @@ class Nav:
         self.queue = deque([k])
         self.done = False
 
-    def work(self, budget=1500):
+    def work(self, budget=2500):
         if self.done or self.queue is None:
             return
         g, dist, q = self.grid, self.dist, self.queue
@@ -222,7 +222,6 @@ class Bot:
         self.laser_hold = 0.0
         self.home = None
         self.prev_dir = None
-        self.hiding = False
 
     # ---------- helpers ----------
     def lead(self, me_pos, mz, tgt, speed):
@@ -253,6 +252,18 @@ class Bot:
         if d <= keep:
             return None  # already comfortably inside
         return cx + dx / d * keep, cy + dy / d * keep, d - keep
+
+    def zone_margin(self, obs, x, y, ahead):
+        """Distance inside the circle `ahead` seconds from now (negative = outside)."""
+        z = obs["zone"]
+        t = obs["t"] + ahead
+        cx, cy, r = z["center"][0], z["center"][1], z["radius"]
+        if t > z["shrink_start"] and z["shrink_end"] > z["shrink_start"]:
+            f = min((t - z["shrink_start"]) / (z["shrink_end"] - z["shrink_start"]), 1.0)
+            cx += (z["next_center"][0] - cx) * f
+            cy += (z["next_center"][1] - cy) * f
+            r += (z["next_radius"] - r) * f
+        return r - math.hypot(x - cx, y - cy)
 
     # ---------- main ----------
     def act(self, obs):
@@ -307,6 +318,8 @@ class Bot:
         boost = False
         goal = self.safe_goal(obs, me)
         zone_urgent = (not me["in_zone"]) or (goal is not None and obs["t"] > obs["zone"]["shrink_start"] - goal[2] / 9.0 - 8)
+        # the circle is about to catch us: nothing else matters
+        zone_critical = (not me["in_zone"]) or self.zone_margin(obs, x, y, 4.0) < 12
         retreat = False
         laser_on_me = None
         for m in mechs:
@@ -328,22 +341,6 @@ class Bot:
         elif self.threat and t - self.threat[1] < 2.5 and (hp_frac < 0.6 or not late):
             retreat = True
 
-        # hide and heal: after being hurt, stay where no recently seen enemy can see us
-        recent = [(p, tt) for (p, v, tt) in self.enemies.values() if t - tt < 15]
-        hurt_recently = t - self.last_hit_t < 25
-        healing = hp_frac < 0.8 and hurt_recently and not late
-        exposed_to = getattr(self, "_exposed", None) if obs["tick"] % 4 else None
-        if healing and recent and obs["tick"] % 4 == 0:
-            for p, tt in recent[:3]:
-                if self.grid.los((p[0], p[1], p[2] + 8), (x, y, z + 4.5)):
-                    exposed_to = p
-                    break
-        self._exposed = exposed_to
-        if healing and not zone_urgent and target is None:
-            retreat = exposed_to is not None
-            if exposed_to is None:
-                self.hiding = True
-
         if goal is not None:
             self.nav.set_goal(goal[0], goal[1])
         dir_goal = None
@@ -354,12 +351,7 @@ class Bot:
                 dir_goal = (math.cos(ang), math.sin(ang))
 
         if retreat:
-            if target is not None:
-                src = target["pos"]
-            elif exposed_to is not None:
-                src = exposed_to
-            else:
-                src = (x + math.cos(self.threat[0]) * 60, y + math.sin(self.threat[0]) * 60, z)
+            src = target["pos"] if target is not None else (x + math.cos(self.threat[0]) * 60, y + math.sin(self.threat[0]) * 60, z)
             key = (round(x / 8), round(y / 8), round(src[0] / 16), round(src[1] / 16))
             if getattr(self, "_cover_key", None) != key or t - getattr(self, "_cover_t", -9) > 1.0:
                 self._cover = self.find_cover(x, y, z, src)
@@ -371,10 +363,7 @@ class Bot:
                 boost = me["energy"] > 25
             elif dir_goal is not None:
                 move = dir_goal
-        hold_still = healing and not zone_urgent and not retreat and target is None and exposed_to is None
-        if move is None and hold_still:
-            pass
-        elif move is None:
+        if move is None:
             if dir_goal is not None:
                 move = dir_goal
                 boost = zone_urgent and me["energy"] > 20
@@ -449,6 +438,17 @@ class Bot:
                 ang = math.atan2(best[1]["pos"][1] - y, best[1]["pos"][0] - x)
                 move = (math.cos(ang), math.sin(ang))
 
+        if zone_critical:
+            z = obs["zone"]
+            zgoal = goal if goal is not None else (z["next_center"][0], z["next_center"][1], 0)
+            self.nav.set_goal(zgoal[0], zgoal[1])
+            d = self.nav.direction(x, y)
+            if d is None:
+                ang = math.atan2(zgoal[1] - y, zgoal[0] - x)
+                d = (math.cos(ang), math.sin(ang))
+            move = d
+            boost = me["energy"] > 5
+
         # ---- stuck handling: jump and jet over what's in the way ----
         jump = False
         sp = math.hypot(me["vel"][0], me["vel"][1])
@@ -471,13 +471,6 @@ class Bot:
             n = math.hypot(*move)
             if n > 1e-6:
                 move = (move[0] / n, move[1] / n)
-            quiet = not (zone_urgent or fighting or retreat or laser_on_me is not None or self.stuck >= 4)
-            if quiet and goal is not None and goal[2] > 120:
-                quiet = False  # far from safety: don't dawdle
-            if quiet:
-                k = 4.6 / max(me["stats"].get("walk_speed", 11.7), 1)
-                move = (move[0] * k, move[1] * k)
-                boost = False
             act["move"] = [round(move[0], 3), round(move[1], 3)]
         else:
             act["move"] = [0, 0]
@@ -497,12 +490,6 @@ class Bot:
             err = abs(wrap(me["aim"][0] - yaw)) + abs(me["aim"][1] - pitch) * 0.5
             tol = math.atan2(2.2, max(d, 1)) + 0.01
             clear = self.grid.los((x, y, mz), at)
-            provoked = (self.threat is not None and t - self.threat[1] < 5
-                        and (aim_t is npc_target or self.threat[2] == aim_t.get("id")))
-            finishing = aim_t.get("hp", 1400) / max(aim_t.get("max_hp", 1400), 1) < 0.3 and d < 150
-            may_fire = provoked or d < 70 or finishing or late or aim_t is npc_target
-            if not may_fire:
-                clear = False
             if gun and gun.get("kind") == "gun" and d < gun["stats"]["range"] and err < tol and clear:
                 if gun.get("ammo", 1) > 0 and gun.get("reload", 0) == 0:
                     fire[0] = True
@@ -540,7 +527,7 @@ class Bot:
                 fire[1] = True  # keep holding; it auto-fires after hold_s
         act["fire"] = fire
 
-        mf.draw.label(f"hp {me['hp']:.0f} {'RET' if retreat else ''}{'HEAL' if hold_still else ''}{'Z' if zone_urgent else ''} t{len(mechs)}")
+        mf.draw.label(f"hp {me['hp']:.0f} {'RET' if retreat else ''}{'ZZ' if zone_critical else ('Z' if zone_urgent else '')} t{len(mechs)}")
         return act
 
     def find_cover(self, x, y, z, src):
@@ -552,7 +539,7 @@ class Bot:
         if k0 < 0:
             return None
         j0, i0 = divmod(k0, g.cnx)
-        for r in range(1, 9):
+        for r in range(1, 11):
             for dj in range(-r, r + 1):
                 for di in (-r, r) if abs(dj) != r else range(-r, r + 1):
                     jj, ii = j0 + dj, i0 + di
